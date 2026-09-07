@@ -1,0 +1,7 @@
+node_modules
+.git
+.railway
+.env
+*.log
+STATUS.md
+README.md
