@@ -1,5 +1,7 @@
 # Telegram Bot (Telegraf)
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/eJeud7)
+
 Node.js **Telegraf** starter that serves **HTTPS webhooks on your Railway domain** (not long polling), exposes **`GET /health`**, and optionally stores sessions on **Railway Redis**.
 
 This listing is meant to replace rotting JS/TS Telegram starters that generate a fake `BOT_TOKEN`, skip healthchecks, and pin Bitnami Redis. HTTP comes up first so Railway health stays green even while you paste a real BotFather token.
