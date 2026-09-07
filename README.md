@@ -1,6 +1,6 @@
 # Deploy and Host Telegram Bot (Telegraf) on Railway
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/eJeud7)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/telegram-bot-telegraf)
 
 Node.js **Telegraf** starter that serves **HTTPS webhooks on your Railway domain** (not long polling), exposes **`GET /health`**, and stores sessions on **Railway Redis**. HTTP binds first, so a missing or dummy `BOT_TOKEN` still deploys healthy.
 
