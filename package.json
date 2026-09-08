@@ -5,10 +5,11 @@
   "description": "Node.js Telegraf bot with Railway webhooks, a healthcheck, and optional Redis sessions",
   "main": "src/index.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=24 <25"
   },
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test"
   },
   "dependencies": {
     "ioredis": "5.8.2",
