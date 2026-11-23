@@ -10,8 +10,10 @@ const { redisSessionStore, sessions } = require("./sessions");
 
 function readConfig(env) {
   const token = (env.BOT_TOKEN || "").trim();
-  if (!token) throw new Error("BOT_TOKEN is required");
-  if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) throw new Error("BOT_TOKEN has an invalid format");
+  if (!token) throw Object.assign(new Error("BOT_TOKEN is required"), { code: "TokenMissing" });
+  if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) {
+    throw Object.assign(new Error("BOT_TOKEN has an invalid format"), { code: "TokenMalformed" });
+  }
   const secret = env.WEBHOOK_SECRET || "";
   if (!/^[A-Za-z0-9_-]{1,256}$/.test(secret)) {
     throw new Error("WEBHOOK_SECRET is required and must contain 1-256 letters, digits, underscores or hyphens");
@@ -31,8 +33,7 @@ function readConfig(env) {
   if (!/^\/[A-Za-z0-9_/-]+$/.test(path) || ["/health", "/healthz", "/ready", "/live"].includes(path)) {
     throw new Error("WEBHOOK_PATH must be a non-reserved URL path");
   }
-  const port = Number(env.PORT || "3000");
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("PORT must be an integer between 0 and 65535");
+  const port = parsePort(env.PORT);
   const redisUrl = (env.REDIS_PRIVATE_URL || env.REDIS_URL || "").trim();
   if (redisUrl) {
     try {
@@ -44,6 +45,25 @@ function readConfig(env) {
   }
   return { token, secret, path, port, host: env.HOST || "0.0.0.0", redisUrl,
     domain: publicUrl.host, webhookUrl: `${publicUrl.origin}${path}` };
+}
+
+function parsePort(value) {
+  const port = Number(value || "3000");
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("PORT must be an integer between 0 and 65535");
+  return port;
+}
+
+// Telegram answers a revoked, reset or mistyped token with 401 Unauthorized.
+function isUnauthorized(error) {
+  return error?.code === 401 || error?.response?.error_code === 401;
+}
+
+// A token Telegram refuses outright: 401, or 421 "forbidden token specified", its answer to a bot
+// ID longer than any it issues (checked against api.telegram.org on 2026-11-23).
+function isTokenRejected(error) {
+  if (isUnauthorized(error)) return true;
+  const code = error?.response?.error_code ?? error?.code;
+  return code === 421 && /forbidden token/i.test(String(error?.response?.description ?? error?.description ?? ""));
 }
 
 function validSecret(header, expected) {
@@ -146,6 +166,7 @@ function createApp({
   let stopPromise;
   let providerCheckedAt = -Infinity;
   let providerCheck;
+  let authenticationFailed = false;
   const calls = new Set();
   const requests = new Set();
 
@@ -166,6 +187,9 @@ function createApp({
           timer = setTimeout(() => controller.abort(), providerTimeoutMs);
         }),
       ]);
+    } catch (error) {
+      if (isTokenRejected(error)) authenticationFailed = true;
+      throw error;
     } finally {
       clearTimeout(timer);
       calls.delete(controller);
@@ -261,7 +285,7 @@ function createApp({
       await bot.handleUpdate(update);
       json(res, 200, { ok: true });
     } catch (error) {
-      if (error.code === 401 || error.response?.error_code === 401) {
+      if (isUnauthorized(error)) {
         state.telegram = "unavailable";
         providerCheckedAt = -Infinity;
       }
@@ -343,17 +367,58 @@ function createApp({
       logger.log("Telegram bot authenticated and webhook verified");
     } catch {
       state.telegram = "unavailable";
-      await stop();
-      throw new Error("Bot startup failed; check BOT_TOKEN, webhook configuration, Telegram connectivity and Redis availability");
+      // Keep Telegram's verdict on the token so main() can tell configuration from outages, even
+      // when the shutdown itself times out.
+      const code = authenticationFailed ? "TokenInvalid" : undefined;
+      try {
+        await stop();
+      } catch (stopError) {
+        logger.error(stopError.message);
+      }
+      throw Object.assign(
+        new Error("Bot startup failed; check BOT_TOKEN, webhook configuration, Telegram connectivity and Redis availability"),
+        { code },
+      );
     }
   }
 
   return { start, stop, health, server, state, config, get bot() { return bot; } };
 }
 
+// Configuration a restart cannot fix. The bot idles with /live up instead of crash-looping, so
+// the deployment stays reachable and the log says what to change.
+const NEEDS_CONFIGURATION = {
+  TokenMissing: "BOT_TOKEN is not set.",
+  TokenMalformed: "BOT_TOKEN is not a BotFather token (those look like 123456789:AAE...).",
+  TokenInvalid: "Telegram rejected BOT_TOKEN.",
+};
+const TOKEN_HELP = "In Telegram open @BotFather, send /mybots, choose the bot and press API Token (or send /newbot "
+  + "to create one), then set that token as BOT_TOKEN on this Railway service and deploy the change.";
+
+function startIdle({ reason, env = process.env, logger = console }) {
+  const port = parsePort(env.PORT);
+  const server = http.createServer((req, res) => {
+    const path = (req.url || "/").split("?", 1)[0].replace(/\/+$/, "") || "/";
+    if (req.method === "GET" && path === "/live") json(res, 200, { ok: true, live: true });
+    else if (req.method === "GET" && ["/", "/health", "/healthz", "/ready"].includes(path)) {
+      json(res, 503, { ok: false, ready: false, live: true, telegram: "needs_configuration", reason, webhook: "inactive" });
+    } else json(res, 404, { error: "not found" });
+  });
+  server.requestTimeout = 15_000;
+  server.headersTimeout = 10_000;
+  server.listen(port, env.HOST || "0.0.0.0");
+  logger.error(`${NEEDS_CONFIGURATION[reason]} The bot is idle and not connected to Telegram. ${TOKEN_HELP}`);
+  return server;
+}
+
 async function main() {
-  const app = createApp();
-  const shutdown = (code) => app.stop().then(
+  let app;
+  let idle;
+  // Idle means the bot was already stopped (its shutdown error, if any, was logged then).
+  const shutdown = (code) => (idle
+    ? new Promise((resolve) => { idle.close(resolve); idle.closeAllConnections(); })
+    : app ? app.stop() : Promise.resolve()
+  ).then(
     () => process.exit(code),
     (error) => { console.error(error.message); process.exit(1); },
   );
@@ -363,11 +428,19 @@ async function main() {
     console.error("Unhandled rejection; stopping the bot");
     shutdown(1);
   });
-  await app.start();
+  try {
+    app = createApp();
+    await app.start();
+  } catch (error) {
+    if (!Object.hasOwn(NEEDS_CONFIGURATION, error.code ?? "")) throw error;
+    idle = startIdle({ reason: error.code });
+    await once(idle, "listening");
+    console.log(`HTTP listening on ${idle.address().port} (idle)`);
+  }
 }
 
 if (require.main === module) {
   main().catch((error) => { console.error(error.message); process.exit(1); });
 }
 
-module.exports = { createApp, readConfig, buildBot, validSecret };
+module.exports = { createApp, readConfig, buildBot, validSecret, startIdle };

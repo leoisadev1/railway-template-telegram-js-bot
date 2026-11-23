@@ -5,7 +5,7 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter, once } = require("node:events");
 const { spawn } = require("node:child_process");
-const { Telegram } = require("telegraf");
+const { Telegram, TelegramError } = require("telegraf");
 const { createApp, readConfig, validSecret } = require("../src/index");
 const { redisSessionStore, sessions } = require("../src/sessions");
 
@@ -86,6 +86,9 @@ test("configuration rejects missing/invalid credentials, domain, path, Redis URL
     { REDIS_URL: "https://isolated.invalid" }, { PORT: "NaN" }, { PORT: "70000" }, { PORT: "1.5" }]) {
     assert.throws(() => createApp({ env: { ...baseEnv, ...patch } }));
   }
+  assert.throws(() => readConfig({ ...baseEnv, BOT_TOKEN: " " }), { code: "TokenMissing" });
+  assert.throws(() => readConfig({ ...baseEnv, BOT_TOKEN: "dummy" }), { code: "TokenMalformed" });
+  assert.throws(() => readConfig({ ...baseEnv, WEBHOOK_SECRET: "" }), (error) => error.code === undefined);
   const config = readConfig({ ...baseEnv, WEBHOOK_PATH: "custom/", REDIS_PRIVATE_URL: "rediss://private.invalid:6379", REDIS_URL: "redis://other.invalid:6379" });
   assert.equal(config.webhookUrl, "https://isolated.invalid/custom");
   assert.equal(config.redisUrl, "rediss://private.invalid:6379");
@@ -126,16 +129,25 @@ test("readiness waits for identity and verified authenticated webhook; liveness 
 });
 
 test("mock provider rejection, bad identity, registration rejection/mismatch and timeout close startup resources", async (t) => {
-  for (const failure of ["token", "identity", "registration", "mismatch", "timeout"]) {
+  const unauthorized = (method) => new TelegramError({ ok: false, error_code: 401, description: "Unauthorized" }, { method });
+  for (const failure of ["token", "token-forbidden", "token-at-registration", "token-at-verification", "identity", "registration", "mismatch", "timeout", "outage", "other-421"]) {
     const f = fixture(t, { app: { providerTimeoutMs: 25 } });
     f.api.intercept = async (method) => {
-      if (failure === "token" && method === "getMe") throw new Error("401 isolated provider rejection");
+      if (failure === "token" && method === "getMe") throw unauthorized(method);
+      // Telegram's reply to a bot ID longer than any it issues.
+      if (failure === "token-forbidden" && method === "getMe") throw new TelegramError({ ok: false, error_code: 421, description: "Misdirected Request: forbidden token specified" }, { method });
+      if (failure === "other-421" && method === "getMe") throw new TelegramError({ ok: false, error_code: 421, description: "Misdirected Request" }, { method });
+      if (failure === "token-at-registration" && method === "setWebhook") throw unauthorized(method);
+      if (failure === "token-at-verification" && method === "getWebhookInfo") throw unauthorized(method);
+      if (failure === "outage" && method === "getMe") throw new TelegramError({ ok: false, error_code: 502, description: "Bad Gateway" }, { method });
       if (failure === "identity" && method === "getMe") return { id: 123, is_bot: false };
       if (failure === "registration" && method === "setWebhook") return false;
       if (failure === "mismatch" && method === "getWebhookInfo") return { url: "https://other.invalid/webhook" };
       if (failure === "timeout" && method === "getMe") return new Promise(() => {});
     };
-    await assert.rejects(f.app.start(), /Bot startup failed/);
+    // Only Telegram's 401 is a token verdict; everything else must stay an ordinary failure.
+    const code = failure.startsWith("token") ? "TokenInvalid" : undefined;
+    await assert.rejects(f.app.start(), (error) => /Bot startup failed/.test(error.message) && error.code === code);
     assert.equal(f.app.server.listening, false);
     assert.equal((await f.app.health()).ready, false);
     assert.equal(f.redis.status, "end");
@@ -368,14 +380,69 @@ async function childResult(args, env = {}) {
   return { code, signal, output: output.join("") };
 }
 
-test("real CLI rejects missing and mocked-invalid credentials with exit 1", async () => {
-  const missing = await childResult(["src/index.js"], { BOT_TOKEN: "" });
-  assert.equal(missing.code, 1);
-  assert.match(missing.output, /BOT_TOKEN is required/);
-  const invalid = await childResult(["--require", "./tests/provider.cjs", "src/index.js"], { TEST_PROVIDER_MODE: "invalid" });
-  assert.equal(invalid.code, 1);
-  assert.match(invalid.output, /Bot startup failed/);
-  assert.ok(!invalid.output.includes(token));
+// Starts the CLI, waits for its idle line, checks /live and /health, then stops it with SIGTERM.
+async function idleResult(t, args, env) {
+  const child = spawn(process.execPath, args, {
+    cwd: require("node:path").join(__dirname, ".."),
+    env: { PATH: process.env.PATH, ...baseEnv, ...env }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
+  t.after(() => { clearTimeout(timer); if (child.exitCode === null) child.kill("SIGKILL"); });
+  const exited = once(child, "exit");
+  let output = "";
+  const listening = new Promise((resolve, reject) => {
+    const read = (data) => {
+      output += data.toString();
+      const port = /HTTP listening on (\d+) \(idle\)/.exec(output)?.[1];
+      if (port) resolve(Number(port));
+    };
+    child.stdout.on("data", read);
+    child.stderr.on("data", read);
+    exited.then(([code]) => reject(new Error(`exited ${code} instead of idling: ${output}`)));
+  });
+  const port = await listening;
+  const get = async (path) => {
+    const response = await fetch(`http://${host}:${port}${path}`);
+    return { status: response.status, body: await response.json() };
+  };
+  const result = { live: await get("/live"), health: await get("/health"), webhook: await fetch(`http://${host}:${port}/webhook`, { method: "POST" }).then((r) => r.status) };
+  child.kill("SIGTERM");
+  const [code, signal] = await exited;
+  return { ...result, code, signal, output };
+}
+
+test("real CLI idles with a token hint on a missing, malformed or rejected BOT_TOKEN", async (t) => {
+  for (const [reason, args, env] of [
+    ["TokenMissing", ["src/index.js"], { BOT_TOKEN: "" }],
+    ["TokenMalformed", ["src/index.js"], { BOT_TOKEN: "not-a-botfather-token" }],
+    ["TokenInvalid", ["--require", "./tests/provider.cjs", "src/index.js"], { TEST_PROVIDER_MODE: "invalid", REDIS_URL: "" }],
+    ["TokenInvalid", ["--require", "./tests/provider.cjs", "src/index.js"], { TEST_PROVIDER_MODE: "forbidden", REDIS_URL: "", BOT_TOKEN: "12345678901234567890:isolated_mock_not_a_real_token" }],
+  ]) {
+    const idle = await idleResult(t, args, env);
+    assert.equal(idle.live.status, 200, reason);
+    assert.equal(idle.health.status, 503, reason);
+    assert.equal(idle.health.body.telegram, "needs_configuration");
+    assert.equal(idle.health.body.reason, reason);
+    assert.equal(idle.health.body.ready, false);
+    assert.equal(idle.webhook, 404);
+    assert.match(idle.output, /The bot is idle and not connected to Telegram\. In Telegram open @BotFather/);
+    assert.equal(idle.output.match(/The bot is idle/g).length, 1);
+    assert.ok(!idle.output.includes(token));
+    assert.deepEqual([idle.code, idle.signal], [0, null], reason);
+  }
+});
+
+test("real CLI still exits 1 on a provider outage or other invalid configuration", async () => {
+  const outage = await childResult(["--require", "./tests/provider.cjs", "src/index.js"], { TEST_PROVIDER_MODE: "outage", REDIS_URL: "" });
+  assert.equal(outage.code, 1);
+  assert.match(outage.output, /Bot startup failed/);
+  assert.doesNotMatch(outage.output, /idle/);
+  const secretMissing = await childResult(["src/index.js"], { WEBHOOK_SECRET: "" });
+  assert.equal(secretMissing.code, 1);
+  assert.match(secretMissing.output, /WEBHOOK_SECRET is required/);
+  const portInvalid = await childResult(["src/index.js"], { BOT_TOKEN: "", PORT: "70000" });
+  assert.equal(portInvalid.code, 1);
+  assert.match(portInvalid.output, /PORT must be an integer/);
 });
 
 for (const signal of ["SIGTERM", "SIGINT"]) {

@@ -14,7 +14,7 @@ The stack contains one non-root Node 24 bot and private authenticated Redis 8.2.
 4. Startup authenticates with `getMe`, registers the webhook, and checks the reported webhook URL. Wait for `/health`, then send `/start` and `/ping` in a real Telegram chat.
 5. Verify actual delivery and replies; a matching `getWebhookInfo` URL alone does not prove that Telegram can reach the service.
 
-**A real BotFather token is required for authentication and delivery.** No live Telegram E2E or real Redis crash-persistence result is claimed. Missing/rejected tokens must fail readiness rather than leave a healthy HTTP-only process.
+**A real BotFather token is required for authentication and delivery.** No live Telegram E2E or real Redis crash-persistence result is claimed. A missing, malformed or rejected `BOT_TOKEN` does not crash-loop: the bot stays idle with no webhook, `/health` returns 503 with `"telegram": "needs_configuration"`, and the deploy log says how to get the token from BotFather. Set the variable and deploy the change. Other startup failures (Redis, webhook registration, a Telegram outage) exit nonzero and Railway restarts the bot.
 
 ### Variables and webhook protection
 
@@ -25,7 +25,7 @@ The stack contains one non-root Node 24 bot and private authenticated Redis 8.2.
 - `WEBHOOK_PATH`: `/webhook`; `PORT`: `3000`; `HOST`: `0.0.0.0` in the container.
 - Redis uses `REDISUSER=default`, `REDISPORT=6379`, and a generated password. Do not expose its credentials or proxy publicly.
 
-`/health`, `/healthz`, `/ready`, and `/` require authenticated provider identity, registered/matching webhook state, and working Redis read/write access. `/live` is independent liveness. Railway uses `/health` with a 60-second startup allowance. Provider state refresh is cached for up to 30 seconds during health/webhook requests; it is not instantaneous token-revocation detection.
+`/health`, `/healthz`, `/ready`, and `/` require authenticated provider identity, registered/matching webhook state, and working Redis read/write access. `/live` is process liveness. Railway's deployment health check uses `/live` with a 60-second allowance and an on-failure restart policy, so a deployment goes live once the process listens, before the Telegram and Redis checks finish; `/health` reports readiness. Provider state refresh is cached for up to 30 seconds during health/webhook requests; it is not instantaneous token-revocation detection.
 
 Wrong/missing webhook secrets are rejected before handlers. Malformed requests are rejected; handler or persistence failures return 503 so Telegram may retry. Shutdown drains work without deleting the replacement deployment's webhook.
 
